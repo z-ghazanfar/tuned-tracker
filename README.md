@@ -1,3 +1,4 @@
+<img width="3248" height="2124" alt="CleanShot 2026-01-02 at 21 21 58@2x" src="https://github.com/user-attachments/assets/e0208440-7c1d-4148-910b-56085267a6d7" />
 # tuned
 
 one thing about me is i love watching tv shows. honestly, i probably watch way too many of them. i built this because i was just tired of forgetting when a new episode for a show i was watching actually released. it's so annoying to have to manually check every week or miss an episode I'd been waiting for because I couldn't remember which day new episodes drop. i wanted a single place that just told me "hey, this show dropped a new episode today."
