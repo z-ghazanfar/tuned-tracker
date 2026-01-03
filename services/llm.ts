@@ -17,7 +17,7 @@ const callWithRetry = async (fn: () => Promise<any>, retries = 3, delay = 1000):
 };
 
 export const generateShowAnalysis = async (show: Show) => {
-  const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   return callWithRetry(async () => {
     try {
@@ -34,23 +34,13 @@ export const generateShowAnalysis = async (show: Show) => {
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              whyWatch: {
-                type: Type.STRING,
-                description: "A compelling paragraph on why this show is worth the user's time."
-              },
-              similarShows: {
+              whyWatch: { type: Type.STRING },
+              similarShows: { 
                 type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: "3 show titles that share the same DNA"
+                items: { type: Type.STRING }
               },
-              targetAudience: {
-                type: Type.STRING,
-                description: "Define the specific niche of fans who would love this."
-              },
-              aiRating: {
-                type: Type.NUMBER,
-                description: "A score from 1.0 to 10.0 based on critical reception and genre impact"
-              }
+              targetAudience: { type: Type.STRING },
+              aiRating: { type: Type.NUMBER }
             },
             required: ["whyWatch", "similarShows", "targetAudience", "aiRating"]
           }
@@ -69,11 +59,10 @@ export const generateShowAnalysis = async (show: Show) => {
 export const getAIRecommendation = async (userList: Show[]) => {
   if (!userList || userList.length === 0) return null;
   
-  const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   const listNames = userList.slice(0, 15).map(s => s.name).join(', ');
-  const prompt = `Based on this user's watchlist: ${listNames}, curate exactly 8 premium recommendations. 
-  Focus on shows that match the tone, complexity, and genre profile of their list.`;
+  const prompt = `Based on this user's watchlist: ${listNames}, curate exactly 8 premium recommendations.`;
 
   return callWithRetry(async () => {
     try {
@@ -81,7 +70,7 @@ export const getAIRecommendation = async (userList: Show[]) => {
         model: 'gemini-3-pro-preview',
         contents: prompt,
         config: {
-          systemInstruction: "You are the 'Tuned' AI Media Curator. Your job is to curate premium recommendations for television enthusiasts. Always return responses in valid JSON format.",
+          systemInstruction: "You are the 'Tuned' AI Media Curator. Suggest premium series. Always return responses in valid JSON format.",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -91,18 +80,9 @@ export const getAIRecommendation = async (userList: Show[]) => {
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    title: { 
-                      type: Type.STRING,
-                      description: "Exact show title"
-                    },
-                    reason: { 
-                      type: Type.STRING,
-                      description: "One-sentence personalized reason why it matches their taste"
-                    },
-                    matchPercentage: { 
-                      type: Type.INTEGER,
-                      description: "Match percentage (1-100)"
-                    }
+                    title: { type: Type.STRING },
+                    reason: { type: Type.STRING },
+                    matchPercentage: { type: Type.INTEGER }
                   },
                   required: ["title", "reason", "matchPercentage"]
                 }
