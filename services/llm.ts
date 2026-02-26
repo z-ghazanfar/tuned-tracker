@@ -67,7 +67,7 @@ export const getAIRecommendation = async (userList: Show[]) => {
   return callWithRetry(async () => {
     try {
       const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3.1-pro-preview',
         contents: prompt,
         config: {
           systemInstruction: "You are the 'Tuned' AI Media Curator. Suggest premium series. Always return responses in valid JSON format.",
