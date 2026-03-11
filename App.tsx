@@ -245,6 +245,112 @@ const ShowCard: React.FC<{
   );
 };
 
+const parseLocalAirdate = (airdate?: string | null) => {
+  if (!airdate) return null;
+
+  const [year, month, day] = airdate.split("-").map(Number);
+  if ([year, month, day].some((value) => Number.isNaN(value))) {
+    return null;
+  }
+
+  return new Date(year, month - 1, day);
+};
+
+const formatAirdate = (airdate?: string | null) => {
+  if (!airdate) return "TBA";
+
+  const localDate = parseLocalAirdate(airdate);
+  if (!localDate) {
+    return airdate;
+  }
+
+  return localDate.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+};
+
+const getEpisodeReleaseDate = (episode: Episode) => {
+  if (episode.airstamp) {
+    const stampDate = new Date(episode.airstamp);
+    if (!Number.isNaN(stampDate.getTime())) {
+      return stampDate;
+    }
+  }
+
+  return parseLocalAirdate(episode.airdate);
+};
+
+const isEpisodeReleased = (episode: Episode) => {
+  const releaseDate = getEpisodeReleaseDate(episode);
+  return releaseDate ? releaseDate <= new Date() : false;
+};
+
+const isEpisodeFuture = (episode: Episode) => {
+  const releaseDate = getEpisodeReleaseDate(episode);
+  return releaseDate ? releaseDate > new Date() : false;
+};
+
+const getProgressPercentage = (watchedCount: number, totalEpisodes: number) => {
+  if (totalEpisodes <= 0) return 0;
+  return (watchedCount / totalEpisodes) * 100;
+};
+
+const getAutoWatchStatus = (
+  watchedCount: number,
+  totalEpisodes: number
+): WatchlistItem["status"] => {
+  if (watchedCount === 0) return "plan-to-watch";
+  if (totalEpisodes > 0 && watchedCount >= totalEpisodes) return "completed";
+  return "watching";
+};
+
+const areEpisodeListsEqual = (left: number[], right: number[]) => {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+};
+
+const syncWatchlistItem = (
+  item: WatchlistItem,
+  episodes: Episode[] = [],
+  options?: { preserveManualStatus?: boolean }
+): WatchlistItem => {
+  const watchedEpisodes = Array.from(new Set(item.watchedEpisodes || []));
+  const autoStatus = getAutoWatchStatus(watchedEpisodes.length, episodes.length);
+  const preserveManualStatus = options?.preserveManualStatus ?? true;
+  const keepManualStatus =
+    preserveManualStatus &&
+    autoStatus === "watching" &&
+    (item.status === "on-hold" || item.status === "dropped");
+
+  return {
+    ...item,
+    watchedEpisodes,
+    status: keepManualStatus ? item.status : autoStatus,
+    progress: getProgressPercentage(watchedEpisodes.length, episodes.length),
+  };
+};
+
+const applyManualStatus = (
+  item: WatchlistItem,
+  episodes: Episode[] = [],
+  status: "watching" | "on-hold"
+): WatchlistItem => {
+  const synced = syncWatchlistItem(item, episodes, {
+    preserveManualStatus: false,
+  });
+
+  if (synced.status === "plan-to-watch" || synced.status === "completed") {
+    return synced;
+  }
+
+  return {
+    ...synced,
+    status,
+  };
+};
+
 // --- Main App ---
 
 const App: React.FC = () => {
@@ -273,7 +379,7 @@ const App: React.FC = () => {
 
   // Library Tab State
   const [libraryTab, setLibraryTab] = useState<
-    "watching" | "plan-to-watch" | "completed"
+    "watching" | "plan-to-watch" | "on-hold" | "completed"
   >("watching");
 
   // Detail View State
@@ -320,6 +426,36 @@ const App: React.FC = () => {
       db.saveUserData(user.uid, watchlist, notifications);
     }
   }, [watchlist, notifications, user, syncing]);
+
+  useEffect(() => {
+    if (Object.keys(episodeCache).length === 0) return;
+
+    setWatchlist((prev) => {
+      let changed = false;
+
+      const next = prev.map((item) => {
+        const episodes = episodeCache[item.showId];
+        if (!episodes) return item;
+
+        const synced = syncWatchlistItem(item, episodes, {
+          preserveManualStatus: true,
+        });
+        const itemChanged =
+          synced.status !== item.status ||
+          synced.progress !== item.progress ||
+          !areEpisodeListsEqual(synced.watchedEpisodes, item.watchedEpisodes);
+
+        if (itemChanged) {
+          changed = true;
+          return synced;
+        }
+
+        return item;
+      });
+
+      return changed ? next : prev;
+    });
+  }, [episodeCache]);
 
   // click outside listener for notifications popover
   useEffect(() => {
@@ -441,10 +577,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const fetchMissingEpisodes = async () => {
-      const activeShows = watchlist.filter(
-        (item) => item.show?.status !== "Ended"
-      );
-      const missingIds = activeShows
+      const missingIds = watchlist
         .map((item) => item.showId)
         .filter((id) => !episodeCache[id]);
 
@@ -518,8 +651,7 @@ const App: React.FC = () => {
       return;
     }
 
-    const airDate = new Date(ep.airstamp || ep.airdate);
-    if (airDate > new Date()) return;
+    if (isEpisodeFuture(ep)) return;
 
     setWatchlist((prev) =>
       prev.map((item) => {
@@ -529,24 +661,69 @@ const App: React.FC = () => {
           const newWatched = isWatched
             ? watched.filter((id) => id !== ep.id)
             : [...watched, ep.id];
+          const nextItem = syncWatchlistItem(
+            {
+              ...item,
+              watchedEpisodes: newWatched,
+            },
+            episodeCache[showId] || currentShowEpisodes,
+            { preserveManualStatus: false }
+          );
 
-          let newStatus = item.status;
-          const totalEps = (episodeCache[showId] || []).length;
-          if (newWatched.length === 0) {
-            newStatus = "plan-to-watch";
-          } else if (totalEps > 0 && newWatched.length >= totalEps) {
-            newStatus = "completed";
-          } else {
-            newStatus = "watching";
-          }
-
-          return {
-            ...item,
-            watchedEpisodes: newWatched,
-            status: newStatus as any,
-          };
+          return nextItem;
         }
         return item;
+      })
+    );
+  };
+
+  const updateShowStatus = (showId: number, status: "watching" | "on-hold") => {
+    if (!user) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+
+    setWatchlist((prev) =>
+      prev.map((item) => {
+        if (item.showId !== showId) return item;
+
+        return applyManualStatus(
+          item,
+          episodeCache[showId] || currentShowEpisodes,
+          status
+        );
+      })
+    );
+  };
+
+  const markSeasonAsCompleted = (showId: number, season: number) => {
+    if (!user) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+
+    setWatchlist((prev) =>
+      prev.map((item) => {
+        if (item.showId !== showId) return item;
+
+        const episodesForShow = episodeCache[showId] || currentShowEpisodes;
+        const releasedSeasonEpisodes = episodesForShow.filter(
+          (episode) => episode.season === season && isEpisodeReleased(episode)
+        );
+
+        if (releasedSeasonEpisodes.length === 0) return item;
+
+        const watchedEpisodes = new Set(item.watchedEpisodes || []);
+        releasedSeasonEpisodes.forEach((episode) => watchedEpisodes.add(episode.id));
+
+        return syncWatchlistItem(
+          {
+            ...item,
+            watchedEpisodes: Array.from(watchedEpisodes),
+          },
+          episodesForShow,
+          { preserveManualStatus: false }
+        );
       })
     );
   };
@@ -572,20 +749,37 @@ const App: React.FC = () => {
     setAnalysisError(false);
     setShowAnalysis(null);
     setEpisodesLoading(true);
-    setCurrentShowEpisodes([]);
+    setCurrentShowEpisodes(episodeCache[show.id] || []);
     setSelectedSeason(1);
 
     try {
-      const [analysis, episodes] = await Promise.all([
+      const [analysisResult, episodesResult] = await Promise.allSettled([
         generateShowAnalysis(show),
         getShowEpisodes(show.id),
       ]);
-      setShowAnalysis(analysis);
-      setCurrentShowEpisodes(episodes || []);
-      if (!analysis) setAnalysisError(true);
+
+      if (analysisResult.status === "fulfilled") {
+        setShowAnalysis(analysisResult.value);
+        if (!analysisResult.value) setAnalysisError(true);
+      } else {
+        console.error("Show analysis failed:", analysisResult.reason);
+        setAnalysisError(true);
+      }
+
+      if (episodesResult.status === "fulfilled") {
+        const episodes = episodesResult.value || [];
+        setCurrentShowEpisodes(episodes);
+        setEpisodeCache((prev) =>
+          prev[show.id] === episodes ? prev : { ...prev, [show.id]: episodes }
+        );
+      } else {
+        console.error("Episode fetch failed:", episodesResult.reason);
+        setCurrentShowEpisodes((prev) =>
+          prev.length > 0 ? prev : episodeCache[show.id] || []
+        );
+      }
     } catch (e) {
       console.error(e);
-      setAnalysisError(true);
     } finally {
       setAnalyzing(false);
       setEpisodesLoading(false);
@@ -598,6 +792,13 @@ const App: React.FC = () => {
     (currentShowEpisodes || []).forEach((ep) => sSet.add(ep.season));
     return Array.from(sSet).sort((a, b) => a - b);
   }, [currentShowEpisodes]);
+
+  useEffect(() => {
+    if (seasons.length === 0) return;
+    if (!seasons.includes(selectedSeason)) {
+      setSelectedSeason(seasons[0]);
+    }
+  }, [seasons, selectedSeason]);
 
   const currentSeasonEpisodes = useMemo(() => {
     return (currentShowEpisodes || []).filter(
@@ -815,12 +1016,15 @@ const App: React.FC = () => {
     const planToWatch = watchlist.filter(
       (item) => item.status === "plan-to-watch"
     );
+    const onHold = watchlist.filter((item) => item.status === "on-hold");
     const completed = watchlist.filter((item) => item.status === "completed");
     const currentItems =
       libraryTab === "watching"
         ? watching
         : libraryTab === "plan-to-watch"
         ? planToWatch
+        : libraryTab === "on-hold"
+        ? onHold
         : completed;
 
     const TabButton: React.FC<{
@@ -917,6 +1121,12 @@ const App: React.FC = () => {
                 icon={Layers}
               />
               <TabButton
+                id="on-hold"
+                label="On Hold"
+                count={onHold.length}
+                icon={Clock}
+              />
+              <TabButton
                 id="completed"
                 label="Completed"
                 count={completed.length}
@@ -974,6 +1184,34 @@ const App: React.FC = () => {
     const watchedEps = (watchItem?.watchedEpisodes || []).length;
     const overallProgress =
       totalEps > 0 ? Math.round((watchedEps / totalEps) * 100) : 0;
+    const currentSeasonProgress =
+      currentSeasonEpisodes.length > 0
+        ? (watchedInCurrentSeasonCount / currentSeasonEpisodes.length) * 100
+        : 0;
+    const releasedSeasonEpisodes = currentSeasonEpisodes.filter((episode) =>
+      isEpisodeReleased(episode)
+    );
+    const watchedReleasedSeasonCount = releasedSeasonEpisodes.filter((episode) =>
+      watchItem?.watchedEpisodes?.includes(episode.id)
+    ).length;
+    const canMarkSeasonComplete =
+      isInWatchlist &&
+      releasedSeasonEpisodes.length > 0 &&
+      watchedReleasedSeasonCount < releasedSeasonEpisodes.length;
+    const showStatusLabel =
+      watchItem?.status === "plan-to-watch"
+        ? "Plan to Watch"
+        : watchItem?.status === "on-hold"
+        ? "On Hold"
+        : watchItem?.status === "completed"
+        ? "Completed"
+        : watchItem?.status === "dropped"
+        ? "Dropped"
+        : watchItem?.status === "watching"
+        ? "Watching"
+        : "Not in Library";
+    const canUseManualStatus =
+      isInWatchlist && watchedEps > 0 && watchedEps < totalEps;
 
     return (
       <div className="space-y-12 animate-in fade-in duration-700 pb-20">
@@ -1177,13 +1415,7 @@ const App: React.FC = () => {
                   <div className="w-full h-1.5 bg-white/5 rounded-full mt-4">
                     <div
                       className="h-full tuned-gradient transition-all duration-1000"
-                      style={{
-                        width: `${
-                          (watchedInCurrentSeasonCount /
-                            currentSeasonEpisodes.length) *
-                          100
-                        }%`,
-                      }}
+                      style={{ width: `${currentSeasonProgress}%` }}
                     />
                   </div>
                 </div>
@@ -1193,6 +1425,51 @@ const App: React.FC = () => {
                     Library Sync Active
                   </span>
                 </div>
+              </div>
+
+              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-[10px] font-black uppercase tracking-[0.3em] text-white/25">
+                    Status
+                  </span>
+                  <span className="rounded-full border border-[#00f5ff]/30 bg-[#00f5ff]/10 px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-[#00f5ff]">
+                    {showStatusLabel}
+                  </span>
+                  {canUseManualStatus && (
+                    <>
+                      <button
+                        onClick={() => updateShowStatus(selectedShow.id, "watching")}
+                        className={`rounded-full px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] transition-all ${
+                          watchItem?.status === "watching"
+                            ? "bg-[#00f5ff] text-black"
+                            : "border border-white/10 bg-white/5 text-white/50 hover:border-white/20 hover:text-white"
+                        }`}
+                      >
+                        Watching
+                      </button>
+                      <button
+                        onClick={() => updateShowStatus(selectedShow.id, "on-hold")}
+                        className={`rounded-full px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] transition-all ${
+                          watchItem?.status === "on-hold"
+                            ? "bg-[#00f5ff] text-black"
+                            : "border border-white/10 bg-white/5 text-white/50 hover:border-white/20 hover:text-white"
+                        }`}
+                      >
+                        Put On Hold
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <button
+                  onClick={() =>
+                    markSeasonAsCompleted(selectedShow.id, selectedSeason)
+                  }
+                  disabled={!canMarkSeasonComplete}
+                  className="rounded-full border border-[#00f5ff]/20 bg-[#00f5ff]/10 px-6 py-3 text-[10px] font-black uppercase tracking-[0.25em] text-[#00f5ff] transition-all hover:border-[#00f5ff] hover:bg-[#00f5ff] hover:text-black disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/20"
+                >
+                  Mark Season Complete
+                </button>
               </div>
             </div>
 
@@ -1208,8 +1485,7 @@ const App: React.FC = () => {
               <div className="grid grid-cols-1 gap-4">
                 {currentSeasonEpisodes.map((ep) => {
                   const isWatched = watchItem?.watchedEpisodes?.includes(ep.id);
-                  const isFuture =
-                    new Date(ep.airstamp || ep.airdate) > new Date();
+                  const isFuture = isEpisodeFuture(ep);
 
                   return (
                     <div
@@ -1256,14 +1532,7 @@ const App: React.FC = () => {
                             </span>
                             <span>•</span>
                             <span>
-                              {new Date(ep.airdate).toLocaleDateString(
-                                "en-US",
-                                {
-                                  month: "short",
-                                  day: "numeric",
-                                  year: "numeric",
-                                }
-                              )}
+                              {formatAirdate(ep.airdate)}
                             </span>
                           </div>
                         </div>

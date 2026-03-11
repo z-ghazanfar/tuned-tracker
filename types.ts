@@ -35,7 +35,7 @@ export interface WatchlistItem {
   showId: number;
   show: Show;
   dateAdded: string;
-  status: 'watching' | 'plan-to-watch' | 'completed' | 'dropped';
+  status: 'watching' | 'plan-to-watch' | 'on-hold' | 'completed' | 'dropped';
   progress: number; 
   watchedEpisodes: number[];
 }
@@ -46,9 +46,9 @@ export interface Episode {
   name: string;
   season: number;
   number: number;
-  airdate: string;
-  airtime: string;
-  airstamp: string;
+  airdate: string | null;
+  airtime: string | null;
+  airstamp: string | null;
   runtime: number;
   summary: string;
   image?: {
