@@ -351,6 +351,9 @@ const applyManualStatus = (
   };
 };
 
+const normalizeShowName = (name: string) =>
+  name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
 // --- Main App ---
 
 const App: React.FC = () => {
@@ -367,6 +370,7 @@ const App: React.FC = () => {
   const [isAIFeatured, setIsAIFeatured] = useState(false);
   const [loading, setLoading] = useState(false);
   const [featuredLoading, setFeaturedLoading] = useState(false);
+  const [featuredRefreshing, setFeaturedRefreshing] = useState(false);
   const [selectedShow, setSelectedShow] = useState<Show | null>(null);
   const [showAnalysis, setShowAnalysis] = useState<any>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -376,6 +380,10 @@ const App: React.FC = () => {
   const [syncing, setSyncing] = useState(false);
 
   const notificationsRef = useRef<HTMLDivElement>(null);
+  const featuredShowsRef = useRef<Show[]>([]);
+  const featuredHistoryIdsRef = useRef<Set<number>>(new Set());
+  const featuredHistoryTitlesRef = useRef<Set<string>>(new Set());
+  const featuredRequestIdRef = useRef(0);
 
   // Library Tab State
   const [libraryTab, setLibraryTab] = useState<
@@ -403,6 +411,10 @@ const App: React.FC = () => {
     const day = String(date.getDate()).padStart(2, "0");
     return `${year}-${month}-${day}`;
   };
+
+  useEffect(() => {
+    featuredShowsRef.current = featuredShows;
+  }, [featuredShows]);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged(async (currentUser: any) => {
@@ -517,43 +529,167 @@ const App: React.FC = () => {
     }
   }, [episodeCache, watchlist, user]);
 
-  // handles featured/personalized dashboard trending view 
-  useEffect(() => {
-    const fetchFeatured = async () => {
-      setFeaturedLoading(true);
+  const featuredTasteSignature = useMemo(
+    () =>
+      watchlist
+        .map((item) => `${item.showId}:${item.status}`)
+        .sort()
+        .join("|"),
+    [watchlist]
+  );
+
+  const fetchFeaturedShows = useCallback(
+    async ({ refresh = false, resetHistory = false } = {}) => {
+      const requestId = ++featuredRequestIdRef.current;
+      const hasExistingFeatured = featuredShowsRef.current.length > 0;
+
+      if (!hasExistingFeatured) {
+        setFeaturedLoading(true);
+      } else {
+        setFeaturedRefreshing(true);
+      }
+
       try {
+        const currentFeatured = featuredShowsRef.current;
+
+        if (resetHistory) {
+          featuredHistoryIdsRef.current = new Set();
+          featuredHistoryTitlesRef.current = new Set();
+        }
+
+        const excludedIds = new Set<number>(watchlist.map((item) => item.showId));
+        const excludedTitles = new Set<string>(
+          watchlist.map((item) => normalizeShowName(item.show.name))
+        );
+
+        featuredHistoryIdsRef.current.forEach((id) => excludedIds.add(id));
+        featuredHistoryTitlesRef.current.forEach((title) =>
+          excludedTitles.add(title)
+        );
+
+        if (refresh) {
+          currentFeatured.forEach((show) => {
+            excludedIds.add(show.id);
+            excludedTitles.add(normalizeShowName(show.name));
+          });
+        }
+
         if (user && watchlist.length > 0) {
-          const userShows = watchlist.map((w) => w.show);
-          const aiRecs = await getAIRecommendation(userShows);
+          const recommendationSource = watchlist
+            .filter((item) => item.status !== "dropped")
+            .map((item) => item.show);
+          const aiRecs = await getAIRecommendation(
+            recommendationSource.length > 0
+              ? recommendationSource
+              : watchlist.map((item) => item.show),
+            {
+              excludeTitles: Array.from(excludedTitles),
+              count: 16,
+              bypassCache: refresh,
+            }
+          );
+
+          if (requestId !== featuredRequestIdRef.current) return;
 
           if (aiRecs && aiRecs.length > 0) {
-            const fullShows: Show[] = [];
+            const nextShows: Show[] = [];
+            const localExcludedIds = new Set(excludedIds);
+            const localExcludedTitles = new Set(excludedTitles);
+
             for (const title of aiRecs) {
-              const res = await searchShows(title);
-              if (res.length > 0) fullShows.push(res[0].show);
-              if (fullShows.length >= 8) break;
+              if (localExcludedTitles.has(normalizeShowName(title))) continue;
+
+              const results = await searchShows(title);
+              if (requestId !== featuredRequestIdRef.current) return;
+
+              const candidate = results
+                .map((result) => result.show)
+                .find(
+                  (show) =>
+                    !!show.image &&
+                    !localExcludedIds.has(show.id) &&
+                    !localExcludedTitles.has(normalizeShowName(show.name)) &&
+                    !nextShows.some((existing) => existing.id === show.id)
+                );
+
+              if (!candidate) continue;
+
+              nextShows.push(candidate);
+              localExcludedIds.add(candidate.id);
+              localExcludedTitles.add(normalizeShowName(candidate.name));
+
+              if (nextShows.length >= 8) break;
             }
 
-            if (fullShows.length > 0) {
-              setFeaturedShows(fullShows);
+            if (nextShows.length > 0) {
+              featuredHistoryIdsRef.current = new Set([
+                ...featuredHistoryIdsRef.current,
+                ...nextShows.map((show) => show.id),
+              ]);
+              featuredHistoryTitlesRef.current = new Set([
+                ...featuredHistoryTitlesRef.current,
+                ...nextShows.map((show) => normalizeShowName(show.name)),
+              ]);
+              setFeaturedShows(nextShows);
+              setCurrentCarouselIndex(0);
               setIsAIFeatured(true);
               return;
             }
           }
         }
 
-        // falls back to general trending if no user or no AI recs
         const topShows = await getSchedule();
-        setFeaturedShows(topShows.slice(0, 8).map((t) => t.show));
+        if (requestId !== featuredRequestIdRef.current) return;
+
+        const fallbackShows = topShows
+          .map((item) => item.show)
+          .filter(
+            (show) =>
+              !!show.image &&
+              !excludedIds.has(show.id) &&
+              !excludedTitles.has(normalizeShowName(show.name))
+          )
+          .slice(0, 8);
+
+        const relaxedFallback =
+          fallbackShows.length > 0
+            ? fallbackShows
+            : topShows
+                .map((item) => item.show)
+                .filter(
+                  (show) =>
+                    !!show.image &&
+                    !watchlist.some((item) => item.showId === show.id) &&
+                    !currentFeatured.some((item) => item.id === show.id)
+                )
+                .slice(0, 8);
+
+        featuredHistoryIdsRef.current = new Set([
+          ...featuredHistoryIdsRef.current,
+          ...relaxedFallback.map((show) => show.id),
+        ]);
+        featuredHistoryTitlesRef.current = new Set([
+          ...featuredHistoryTitlesRef.current,
+          ...relaxedFallback.map((show) => normalizeShowName(show.name)),
+        ]);
+        setFeaturedShows(relaxedFallback);
+        setCurrentCarouselIndex(0);
         setIsAIFeatured(false);
       } catch (e) {
         console.error("Featured Fetch Error", e);
       } finally {
-        setFeaturedLoading(false);
+        if (requestId === featuredRequestIdRef.current) {
+          setFeaturedLoading(false);
+          setFeaturedRefreshing(false);
+        }
       }
-    };
-    fetchFeatured();
-  }, [user, watchlist.length]);
+    },
+    [user, watchlist]
+  );
+
+  useEffect(() => {
+    fetchFeaturedShows({ resetHistory: true });
+  }, [fetchFeaturedShows, featuredTasteSignature, user?.uid]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -882,7 +1018,7 @@ const App: React.FC = () => {
     return (
       <div className="space-y-16 animate-in fade-in duration-700">
         <section className="relative h-[600px] rounded-[48px] overflow-hidden group shadow-[0_40px_100px_rgba(0,0,0,0.8)] border border-white/5 bg-black">
-          {featuredLoading ? (
+          {featuredLoading && featuredShows.length === 0 ? (
             <div className="w-full h-full flex flex-col items-center justify-center space-y-4">
               <Loader2 className="animate-spin text-[#00f5ff]" size={48} />
               <span className="text-[10px] font-black uppercase tracking-[0.4em] text-white/40">
@@ -933,6 +1069,18 @@ const App: React.FC = () => {
                     </button>
 
                     <div className="flex items-center space-x-4">
+                      <button
+                        onClick={() => fetchFeaturedShows({ refresh: true })}
+                        disabled={featuredRefreshing}
+                        className="p-4 rounded-full bg-[#00f5ff]/15 hover:bg-[#00f5ff]/25 text-[#00f5ff] transition-all backdrop-blur-xl border border-[#00f5ff]/20 disabled:opacity-60 disabled:cursor-not-allowed"
+                        title="Load fresh recommendations"
+                        aria-label="Load fresh recommendations"
+                      >
+                        <RefreshCcw
+                          size={20}
+                          className={featuredRefreshing ? "animate-spin" : ""}
+                        />
+                      </button>
                       <button
                         onClick={prevFeatured}
                         className="p-4 rounded-full bg-white/10 hover:bg-white/20 text-white transition-all backdrop-blur-xl"

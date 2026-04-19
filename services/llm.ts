@@ -18,6 +18,12 @@ type ShowAnalysis = {
   aiRating: number;
 };
 
+type RecommendationOptions = {
+  excludeTitles?: string[];
+  count?: number;
+  bypassCache?: boolean;
+};
+
 const callWithRetry = async (
   fn: () => Promise<any>,
   retries = 3,
@@ -77,17 +83,30 @@ const setCache = <T>(key: string, value: T, ttlMs: number) => {
 const cleanSummary = (summary: string) =>
   summary.replace(/<[^>]*>?/gm, "").replace(/\s+/g, " ").trim();
 
+const normalizeRecommendationTitle = (title: string) =>
+  title.toLowerCase().trim();
+
 const createAnalysisCacheKey = (show: Show) =>
   `tuned:ai:analysis:${show.id}:${show.updated}`;
 
-const createRecommendationCacheKey = (userList: Show[]) => {
+const createRecommendationCacheKey = (
+  userList: Show[],
+  options: RecommendationOptions = {}
+) => {
   const signature = userList
     .slice(0, 15)
     .map((show) => `${show.id}:${show.updated}:${show.name.toLowerCase()}`)
     .sort()
     .join("|");
 
-  return `tuned:ai:recs:${signature}`;
+  const excludeSignature = (options.excludeTitles || [])
+    .map(normalizeRecommendationTitle)
+    .filter(Boolean)
+    .sort()
+    .slice(0, 40)
+    .join("|");
+
+  return `tuned:ai:recs:${signature}:count:${options.count || 8}:exclude:${excludeSignature}`;
 };
 
 export const generateShowAnalysis = async (show: Show) => {
@@ -145,12 +164,27 @@ export const generateShowAnalysis = async (show: Show) => {
   });
 };
 
-export const getAIRecommendation = async (userList: Show[]) => {
+export const getAIRecommendation = async (
+  userList: Show[],
+  options: RecommendationOptions = {}
+) => {
   if (!userList || userList.length === 0) return null;
 
-  const cacheKey = createRecommendationCacheKey(userList);
-  const cached = getCache<string[]>(cacheKey);
-  if (cached) return cached;
+  const count = Math.min(Math.max(options.count || 8, 1), 16);
+  const uniqueExcludedTitles = Array.from(
+    new Set(
+      (options.excludeTitles || []).map((title) => title.trim()).filter(Boolean)
+    )
+  );
+  const cacheKey = createRecommendationCacheKey(userList, {
+    excludeTitles: uniqueExcludedTitles,
+    count,
+  });
+
+  if (!options.bypassCache) {
+    const cached = getCache<string[]>(cacheKey);
+    if (cached) return cached;
+  }
 
   const apiKey = getApiKey();
   if (!apiKey) return null;
@@ -164,10 +198,18 @@ export const getAIRecommendation = async (userList: Show[]) => {
 
   const prompt = [
     `Based on this watchlist: ${listNames}.`,
-    "Return exactly 8 TV series or anime titles only.",
+    uniqueExcludedTitles.length > 0
+      ? `Do not recommend any of these titles: ${uniqueExcludedTitles
+          .slice(0, 40)
+          .join(", ")}.`
+      : "",
+    `Return exactly ${count} TV series or anime titles only.`,
+    "Recommend fresh picks that are closely related to the user's taste and are likely new to them.",
     "Prefer well-known titles that can be found in TVMaze search.",
     "No explanations.",
-  ].join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return callWithRetry(async () => {
     try {
@@ -200,8 +242,17 @@ export const getAIRecommendation = async (userList: Show[]) => {
       if (!jsonStr) return [];
 
       const parsed = JSON.parse(jsonStr) as { recommendations?: string[] };
-      const recommendations = (parsed.recommendations || []).slice(0, 8);
-      setCache(cacheKey, recommendations, RECOMMENDATION_CACHE_TTL_MS);
+      const recommendations = Array.from(
+        new Set(
+          (parsed.recommendations || [])
+            .map((title) => title.trim())
+            .filter(Boolean)
+        )
+      ).slice(0, count);
+
+      if (!options.bypassCache) {
+        setCache(cacheKey, recommendations, RECOMMENDATION_CACHE_TTL_MS);
+      }
       return recommendations;
     } catch (error) {
       console.error("Gemini Recommendation Error:", error);
