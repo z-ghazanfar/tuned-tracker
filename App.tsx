@@ -528,8 +528,8 @@ const App: React.FC = () => {
 
           if (aiRecs && aiRecs.length > 0) {
             const fullShows: Show[] = [];
-            for (const rec of aiRecs) {
-              const res = await searchShows(rec.title);
+            for (const title of aiRecs) {
+              const res = await searchShows(title);
               if (res.length > 0) fullShows.push(res[0].show);
               if (fullShows.length >= 8) break;
             }
@@ -537,16 +537,15 @@ const App: React.FC = () => {
             if (fullShows.length > 0) {
               setFeaturedShows(fullShows);
               setIsAIFeatured(true);
+              return;
             }
           }
         }
 
         // falls back to general trending if no user or no AI recs
-        if (!user || featuredShows.length === 0) {
-          const topShows = await getSchedule();
-          setFeaturedShows(topShows.slice(0, 8).map((t) => t.show));
-          setIsAIFeatured(false);
-        }
+        const topShows = await getSchedule();
+        setFeaturedShows(topShows.slice(0, 8).map((t) => t.show));
+        setIsAIFeatured(false);
       } catch (e) {
         console.error("Featured Fetch Error", e);
       } finally {
