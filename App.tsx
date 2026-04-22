@@ -354,6 +354,30 @@ const applyManualStatus = (
 const normalizeShowName = (name: string) =>
   name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
+type LibraryTab =
+  | "airing"
+  | "watching"
+  | "plan-to-watch"
+  | "on-hold"
+  | "completed";
+
+type RecentUnwatchedEpisode = {
+  showId: number;
+  show: Show;
+  episode: Episode;
+  releaseDate: Date;
+};
+
+type RecentUnwatchedShowGroup = {
+  showId: number;
+  show: Show;
+  episodes: RecentUnwatchedEpisode[];
+  nextEpisode: RecentUnwatchedEpisode;
+};
+
+const RECENT_AIRING_WINDOW_DAYS = 21;
+const AIRING_MARK_WATCHED_GRACE_MS = 10000;
+
 // --- Main App ---
 
 const App: React.FC = () => {
@@ -386,9 +410,16 @@ const App: React.FC = () => {
   const featuredRequestIdRef = useRef(0);
 
   // Library Tab State
-  const [libraryTab, setLibraryTab] = useState<
-    "watching" | "plan-to-watch" | "on-hold" | "completed"
-  >("watching");
+  const [libraryTab, setLibraryTab] = useState<LibraryTab>("watching");
+  const [expandedAiringShowId, setExpandedAiringShowId] = useState<
+    number | null
+  >(null);
+  const [airingPendingRemovals, setAiringPendingRemovals] = useState<
+    Record<number, true>
+  >({});
+  const airingPendingRemovalTimeoutsRef = useRef<
+    Record<number, ReturnType<typeof setTimeout>>
+  >({});
 
   // Detail View State
   const [selectedSeason, setSelectedSeason] = useState(1);
@@ -412,9 +443,33 @@ const App: React.FC = () => {
     return `${year}-${month}-${day}`;
   };
 
+  const clearAiringPendingRemoval = (episodeId: number) => {
+    const timeout = airingPendingRemovalTimeoutsRef.current[episodeId];
+    if (timeout) {
+      clearTimeout(timeout);
+      delete airingPendingRemovalTimeoutsRef.current[episodeId];
+    }
+
+    setAiringPendingRemovals((prev) => {
+      if (!prev[episodeId]) return prev;
+
+      const next = { ...prev };
+      delete next[episodeId];
+      return next;
+    });
+  };
+
   useEffect(() => {
     featuredShowsRef.current = featuredShows;
   }, [featuredShows]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(airingPendingRemovalTimeoutsRef.current).forEach((timeout) =>
+        clearTimeout(timeout)
+      );
+    };
+  }, []);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged(async (currentUser: any) => {
@@ -812,6 +867,50 @@ const App: React.FC = () => {
     );
   };
 
+  const toggleAiringEpisodeWatched = (showId: number, ep: Episode) => {
+    if (!user) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+
+    if (isEpisodeFuture(ep)) return;
+
+    const isWatched = watchlist
+      .find((item) => item.showId === showId)
+      ?.watchedEpisodes?.includes(ep.id);
+    const isPendingRemoval = !!airingPendingRemovals[ep.id] && !!isWatched;
+
+    if (isPendingRemoval) {
+      clearAiringPendingRemoval(ep.id);
+      toggleEpisodeWatched(showId, ep);
+      return;
+    }
+
+    if (isWatched) return;
+
+    toggleEpisodeWatched(showId, ep);
+    const existingTimeout = airingPendingRemovalTimeoutsRef.current[ep.id];
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+
+    setAiringPendingRemovals((prev) => ({
+      ...prev,
+      [ep.id]: true,
+    }));
+
+    airingPendingRemovalTimeoutsRef.current[ep.id] = setTimeout(() => {
+      setAiringPendingRemovals((prev) => {
+        if (!prev[ep.id]) return prev;
+
+        const next = { ...prev };
+        delete next[ep.id];
+        return next;
+      });
+      delete airingPendingRemovalTimeoutsRef.current[ep.id];
+    }, AIRING_MARK_WATCHED_GRACE_MS);
+  };
+
   const updateShowStatus = (showId: number, status: "watching" | "on-hold") => {
     if (!user) {
       setIsAuthModalOpen(true);
@@ -974,10 +1073,112 @@ const App: React.FC = () => {
     });
   }, [viewedDate]);
 
+  const recentUnwatchedAiringGroups = useMemo<RecentUnwatchedShowGroup[]>(() => {
+    const now = new Date();
+    const cutoff = new Date(now);
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - RECENT_AIRING_WINDOW_DAYS);
+
+    return watchlist
+      .flatMap((item) => {
+        if (
+          item.status !== "watching" ||
+          item.show.status !== "Running" ||
+          item.show.schedule.days.length === 0
+        ) {
+          return [];
+        }
+
+        const watchedEpisodes = new Set(item.watchedEpisodes || []);
+        const recentEpisodes = (episodeCache[item.showId] || [])
+          .map((episode) => ({
+            episode,
+            releaseDate: getEpisodeReleaseDate(episode),
+          }))
+          .filter(
+            (
+              entry
+            ): entry is {
+              episode: Episode;
+              releaseDate: Date;
+            } => !!entry.releaseDate
+          )
+          .filter(
+            ({ episode, releaseDate }) =>
+              (!watchedEpisodes.has(episode.id) ||
+                !!airingPendingRemovals[episode.id]) &&
+              releaseDate <= now &&
+              releaseDate >= cutoff
+          )
+          .sort(
+            (left, right) =>
+              left.episode.season - right.episode.season ||
+              left.episode.number - right.episode.number ||
+              left.releaseDate.getTime() - right.releaseDate.getTime()
+          )
+          .slice(0, 3);
+
+        if (recentEpisodes.length === 0) {
+          return [];
+        }
+
+        return [
+          {
+            showId: item.showId,
+            show: item.show,
+            episodes: recentEpisodes.map(({ episode, releaseDate }) => ({
+              showId: item.showId,
+              show: item.show,
+              episode,
+              releaseDate,
+            })),
+            nextEpisode: {
+              showId: item.showId,
+              show: item.show,
+              episode: recentEpisodes[0].episode,
+              releaseDate: recentEpisodes[0].releaseDate,
+            },
+          },
+        ];
+      })
+      .sort((left, right) => left.show.name.localeCompare(right.show.name));
+  }, [watchlist, episodeCache, airingPendingRemovals]);
+
+  const recentAiringShowCount = useMemo(
+    () => recentUnwatchedAiringGroups.length,
+    [recentUnwatchedAiringGroups]
+  );
+
+  const recentAiringEpisodeCount = useMemo(
+    () =>
+      recentUnwatchedAiringGroups.reduce(
+        (total, group) => total + group.episodes.length,
+        0
+      ),
+    [recentUnwatchedAiringGroups]
+  );
+
+  const calendarWatchlist = useMemo(
+    () => watchlist.filter((item) => item.status === "watching"),
+    [watchlist]
+  );
+
+  useEffect(() => {
+    if (expandedAiringShowId === null) return;
+
+    const hasExpandedGroup = recentUnwatchedAiringGroups.some(
+      (group) => group.showId === expandedAiringShowId
+    );
+
+    if (!hasExpandedGroup) {
+      setExpandedAiringShowId(null);
+    }
+  }, [expandedAiringShowId, recentUnwatchedAiringGroups]);
+
   const getEpisodesForDay = (date: Date) => {
     const targetDateStr = formatDateString(date);
     const results: { show: Show; episode: Episode }[] = [];
-    watchlist.forEach((item) => {
+    calendarWatchlist.forEach((item) => {
       const episodes = episodeCache[item.showId];
       if (episodes) {
         const ep = episodes.find((e) => e.airdate === targetDateStr);
@@ -1159,6 +1360,7 @@ const App: React.FC = () => {
   };
 
   const renderMyList = () => {
+    const airing = recentUnwatchedAiringGroups;
     const watching = watchlist.filter((item) => item.status === "watching");
     const planToWatch = watchlist.filter(
       (item) => item.status === "plan-to-watch"
@@ -1166,7 +1368,9 @@ const App: React.FC = () => {
     const onHold = watchlist.filter((item) => item.status === "on-hold");
     const completed = watchlist.filter((item) => item.status === "completed");
     const currentItems =
-      libraryTab === "watching"
+      libraryTab === "airing"
+        ? []
+        : libraryTab === "watching"
         ? watching
         : libraryTab === "plan-to-watch"
         ? planToWatch
@@ -1175,7 +1379,7 @@ const App: React.FC = () => {
         : completed;
 
     const TabButton: React.FC<{
-      id: typeof libraryTab;
+      id: LibraryTab;
       label: string;
       count: number;
       icon: any;
@@ -1220,7 +1424,13 @@ const App: React.FC = () => {
               My Library
             </h2>
             <p className="text-white/40 text-lg mt-2">
-              Tracking {watchlist.length} shows in your collection.
+              {libraryTab === "airing"
+                ? `${recentAiringEpisodeCount} recent unwatched episode${
+                    recentAiringEpisodeCount === 1 ? "" : "s"
+                  } across ${recentAiringShowCount} currently airing ${
+                    recentAiringShowCount === 1 ? "show" : "shows"
+                  }.`
+                : `Tracking ${watchlist.length} shows in your collection.`}
             </p>
           </div>
         </div>
@@ -1256,6 +1466,12 @@ const App: React.FC = () => {
           <div className="space-y-10">
             <div className="flex items-center space-x-4 p-2 surface-low rounded-[40px] tuned-border w-fit max-w-full overflow-x-auto no-scrollbar">
               <TabButton
+                id="airing"
+                label="Airing"
+                count={recentAiringShowCount}
+                icon={Bell}
+              />
+              <TabButton
                 id="watching"
                 label="Watching"
                 count={watching.length}
@@ -1281,7 +1497,219 @@ const App: React.FC = () => {
               />
             </div>
 
-            {currentItems.length > 0 ? (
+            {libraryTab === "airing" ? (
+              <div className="space-y-6">
+                <div className="surface-mid rounded-[32px] tuned-border p-6 md:p-8">
+                  <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                    <div className="space-y-2">
+                      <div className="flex items-center space-x-3 text-[#00f5ff] font-black text-xs uppercase tracking-[0.3em]">
+                        <Bell size={14} />
+                        <span>Current Catch-Up</span>
+                      </div>
+                      <p className="text-white/50 max-w-2xl leading-relaxed">
+                        Only recent unwatched episodes from shows you marked as
+                        watching, are still running, and have an active release
+                        schedule. Older backlog episodes stay out of this view.
+                      </p>
+                    </div>
+                    <div className="rounded-full border border-[#00f5ff]/20 bg-[#00f5ff]/10 px-5 py-2 text-[10px] font-black uppercase tracking-[0.25em] text-[#00f5ff]">
+                      Last {RECENT_AIRING_WINDOW_DAYS} Days
+                    </div>
+                  </div>
+                </div>
+
+                {loadingEpisodes && airing.length === 0 ? (
+                  <div className="flex items-center justify-center py-32">
+                    <Loader2 className="animate-spin text-[#00f5ff]" size={40} />
+                  </div>
+                ) : airing.length > 0 ? (
+                  <div className="grid grid-cols-1 gap-4 animate-in slide-in-from-bottom-4 duration-500">
+                    {airing.map(({ showId, show, episodes, nextEpisode }) => {
+                      const isExpanded = expandedAiringShowId === showId;
+
+                      return (
+                        <div
+                          key={showId}
+                          className="surface-mid rounded-[36px] tuned-border p-5 md:p-6 transition-all duration-300 hover:border-[#00f5ff]/30"
+                        >
+                          <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="flex items-center gap-5 min-w-0">
+                              <button
+                                onClick={() => openDetails(show)}
+                                className="w-20 h-28 shrink-0 overflow-hidden rounded-[24px] border border-white/10"
+                              >
+                                <img
+                                  src={
+                                    show.image?.medium ||
+                                    `https://picsum.photos/seed/${show.id}/300/420`
+                                  }
+                                  alt={show.name}
+                                  className="h-full w-full object-cover"
+                                />
+                              </button>
+
+                              <div className="min-w-0 space-y-2">
+                                <div className="flex flex-wrap items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-white/30">
+                                  <span className="text-[#00f5ff]">Now Airing</span>
+                                  <span>•</span>
+                                  <span>
+                                    Next Up S{nextEpisode.episode.season}E
+                                    {nextEpisode.episode.number}
+                                  </span>
+                                  {show.schedule.days.length > 0 && (
+                                    <>
+                                      <span>•</span>
+                                      <span>{show.schedule.days.join(", ")}</span>
+                                    </>
+                                  )}
+                                </div>
+
+                                <button
+                                  onClick={() => openDetails(show)}
+                                  className="text-left"
+                                >
+                                  <h3 className="truncate text-2xl font-black font-outfit tracking-tight text-white transition-colors hover:text-[#00f5ff]">
+                                    {show.name}
+                                  </h3>
+                                </button>
+
+                                <p className="text-lg font-bold text-white/80">
+                                  {episodes.length} unwatched recent episode
+                                  {episodes.length === 1 ? "" : "s"}
+                                </p>
+
+                                <p className="line-clamp-2 max-w-2xl text-sm text-white/40">
+                                  {(
+                                    nextEpisode.episode.summary ||
+                                    show.summary ||
+                                    ""
+                                  ).replace(
+                                    /<[^>]*>?/gm,
+                                    ""
+                                  ) || "No summary available."}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-3 shrink-0">
+                              <button
+                                onClick={() => openDetails(show)}
+                                className="rounded-full border border-white/10 bg-white/5 px-5 py-3 text-[10px] font-black uppercase tracking-[0.2em] text-white/70 transition-all hover:border-white/20 hover:text-white"
+                              >
+                                Open Show
+                              </button>
+                              <button
+                                onClick={() =>
+                                  setExpandedAiringShowId((current) =>
+                                    current === showId ? null : showId
+                                  )
+                                }
+                                className="inline-flex items-center gap-2 rounded-full border border-[#00f5ff]/20 bg-[#00f5ff]/10 px-5 py-3 text-[10px] font-black uppercase tracking-[0.2em] text-[#00f5ff] transition-all hover:border-[#00f5ff] hover:bg-[#00f5ff] hover:text-black"
+                                aria-expanded={isExpanded}
+                              >
+                                <ChevronRight
+                                  size={16}
+                                  className={`transition-transform ${
+                                    isExpanded ? "rotate-90" : ""
+                                  }`}
+                                />
+                                <span>
+                                  {isExpanded
+                                    ? "Hide Episodes"
+                                    : "View Episodes"}
+                                </span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {isExpanded && (
+                            <div className="mt-5 space-y-3 border-t border-white/5 pt-5">
+                              {episodes.map(({ episode }) => {
+                                const isPendingRemoval =
+                                  !!airingPendingRemovals[episode.id] &&
+                                  !!watchlist
+                                    .find((item) => item.showId === showId)
+                                    ?.watchedEpisodes?.includes(episode.id);
+
+                                return (
+                                  <div
+                                    key={episode.id}
+                                    className={`flex flex-col gap-4 rounded-[28px] border p-4 md:flex-row md:items-center md:justify-between ${
+                                      isPendingRemoval
+                                        ? "border-[#00f5ff]/20 bg-[#00f5ff]/5"
+                                        : "border-white/5 bg-black/20"
+                                    }`}
+                                  >
+                                    <div className="min-w-0 space-y-1">
+                                      <div className="flex flex-wrap items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-white/30">
+                                        <span>
+                                          S{episode.season}E{episode.number}
+                                        </span>
+                                        <span>•</span>
+                                        <span>
+                                          {formatAirdate(episode.airdate)}
+                                        </span>
+                                      </div>
+                                      <p className="text-base font-bold text-white/85">
+                                        {episode.name}
+                                      </p>
+                                      {isPendingRemoval && (
+                                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-[#00f5ff]">
+                                          Marked watched. Stays here briefly in
+                                          case you want to undo.
+                                        </p>
+                                      )}
+                                      <p className="line-clamp-2 max-w-2xl text-sm text-white/40">
+                                        {(episode.summary || "").replace(
+                                          /<[^>]*>?/gm,
+                                          ""
+                                        ) || "No episode summary available."}
+                                      </p>
+                                    </div>
+
+                                    <button
+                                      onClick={() =>
+                                        toggleAiringEpisodeWatched(
+                                          showId,
+                                          episode
+                                        )
+                                      }
+                                      className={`inline-flex items-center gap-2 self-start rounded-full px-5 py-3 text-[10px] font-black uppercase tracking-[0.2em] transition-all md:self-center ${
+                                        isPendingRemoval
+                                          ? "border border-white/10 bg-white/5 text-white/70 hover:border-white/20 hover:text-white"
+                                          : "border border-[#00f5ff]/20 bg-[#00f5ff]/10 text-[#00f5ff] hover:border-[#00f5ff] hover:bg-[#00f5ff] hover:text-black"
+                                      }`}
+                                    >
+                                      {isPendingRemoval ? (
+                                        <RefreshCcw size={16} />
+                                      ) : (
+                                        <CheckCircle2 size={16} />
+                                      )}
+                                      <span>
+                                        {isPendingRemoval
+                                          ? "Undo"
+                                          : "Mark Watched"}
+                                      </span>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="py-32 flex flex-col items-center justify-center surface-mid rounded-[40px] tuned-border opacity-60 border-dashed border-white/10">
+                    <Bell size={48} className="text-white/10 mb-6" />
+                    <p className="text-white/40 font-black font-outfit uppercase tracking-widest text-xs">
+                      No recent airing episodes to catch up on
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : currentItems.length > 0 ? (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-8 animate-in slide-in-from-bottom-4 duration-500">
                 {currentItems.map((item) => {
                   const totalEps = (episodeCache[item.showId] || []).length;
