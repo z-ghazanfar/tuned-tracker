@@ -377,6 +377,165 @@ type RecentUnwatchedShowGroup = {
 
 const RECENT_AIRING_WINDOW_DAYS = 21;
 const AIRING_MARK_WATCHED_GRACE_MS = 10000;
+const DASHBOARD_RELEASE_LIMIT = 15;
+
+type UpcomingScheduleItem = {
+  show: Show;
+  airtime?: string | null;
+  scheduleDate?: string;
+  runtime?: number | null;
+};
+
+type TasteProfile = {
+  hasSignal: boolean;
+  genreWeights: Map<string, number>;
+  typeWeights: Map<string, number>;
+  languageWeights: Map<string, number>;
+  trackedIds: Set<number>;
+};
+
+const STATUS_TASTE_WEIGHTS: Record<WatchlistItem["status"], number> = {
+  watching: 5,
+  completed: 4,
+  "plan-to-watch": 3,
+  "on-hold": 1.5,
+  dropped: 0,
+};
+
+const RELEASE_GENRE_PENALTIES = new Set([
+  "reality",
+  "talk",
+  "news",
+  "sports",
+  "game show",
+]);
+
+const buildTasteProfile = (items: WatchlistItem[]): TasteProfile => {
+  const genreWeights = new Map<string, number>();
+  const typeWeights = new Map<string, number>();
+  const languageWeights = new Map<string, number>();
+  const trackedIds = new Set<number>();
+
+  items.forEach((item) => {
+    trackedIds.add(item.showId);
+
+    const statusWeight = STATUS_TASTE_WEIGHTS[item.status] || 0;
+    if (statusWeight <= 0) return;
+
+    const progressWeight = Math.min(Math.max(item.progress || 0, 0), 100) / 100;
+    const weight = statusWeight + progressWeight;
+
+    item.show.genres.forEach((genre) => {
+      const key = genre.toLowerCase();
+      genreWeights.set(key, (genreWeights.get(key) || 0) + weight);
+    });
+
+    if (item.show.type) {
+      const key = item.show.type.toLowerCase();
+      typeWeights.set(key, (typeWeights.get(key) || 0) + weight);
+    }
+
+    if (item.show.language) {
+      const key = item.show.language.toLowerCase();
+      languageWeights.set(key, (languageWeights.get(key) || 0) + weight);
+    }
+  });
+
+  return {
+    hasSignal:
+      genreWeights.size > 0 || typeWeights.size > 0 || languageWeights.size > 0,
+    genreWeights,
+    typeWeights,
+    languageWeights,
+    trackedIds,
+  };
+};
+
+const getScheduleDateWeight = (scheduleDate?: string) => {
+  if (!scheduleDate) return 0;
+
+  const releaseDate = parseLocalAirdate(scheduleDate);
+  if (!releaseDate) return 0;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const daysAway = Math.max(
+    0,
+    Math.round((releaseDate.getTime() - today.getTime()) / 86400000)
+  );
+  return Math.max(0, 3 - daysAway * 0.35);
+};
+
+const scoreReleaseForTaste = (
+  item: UpcomingScheduleItem,
+  profile: TasteProfile
+) => {
+  const show = item.show;
+  const ratingScore = (show.rating?.average || 0) * 1.4;
+  const dateScore = getScheduleDateWeight(item.scheduleDate);
+  const trackedScore = profile.trackedIds.has(show.id) ? 35 : 0;
+
+  const genreScore = show.genres.reduce((total, genre) => {
+    const key = genre.toLowerCase();
+    const penalty = RELEASE_GENRE_PENALTIES.has(key) ? -20 : 0;
+    return total + (profile.genreWeights.get(key) || 0) * 4 + penalty;
+  }, 0);
+
+  const typeScore = show.type
+    ? (profile.typeWeights.get(show.type.toLowerCase()) || 0) * 1.25
+    : 0;
+  const languageScore = show.language
+    ? (profile.languageWeights.get(show.language.toLowerCase()) || 0) * 0.75
+    : 0;
+
+  return (
+    trackedScore +
+    genreScore +
+    typeScore +
+    languageScore +
+    ratingScore +
+    dateScore
+  );
+};
+
+const getPersonalizedReleases = (
+  schedule: UpcomingScheduleItem[],
+  items: WatchlistItem[]
+) => {
+  const profile = buildTasteProfile(items);
+  const seenShows = new Set<number>();
+
+  const uniqueSchedule = schedule.filter((item) => {
+    if (!item.show || seenShows.has(item.show.id)) return false;
+    seenShows.add(item.show.id);
+    return true;
+  });
+
+  if (!profile.hasSignal) {
+    return uniqueSchedule
+      .sort(
+        (left, right) =>
+          (right.show.rating?.average || 0) - (left.show.rating?.average || 0)
+      )
+      .slice(0, DASHBOARD_RELEASE_LIMIT);
+  }
+
+  return uniqueSchedule
+    .map((item) => ({
+      item,
+      score: scoreReleaseForTaste(item, profile),
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return (
+        (right.item.show.rating?.average || 0) -
+        (left.item.show.rating?.average || 0)
+      );
+    })
+    .map(({ item }) => item)
+    .slice(0, DASHBOARD_RELEASE_LIMIT);
+};
 
 // --- Main App ---
 
@@ -1158,6 +1317,16 @@ const App: React.FC = () => {
     [recentUnwatchedAiringGroups]
   );
 
+  const personalizedReleases = useMemo(
+    () => getPersonalizedReleases(upcomingGlobal, watchlist),
+    [upcomingGlobal, watchlist]
+  );
+
+  const hasReleaseTasteSignal = useMemo(
+    () => buildTasteProfile(watchlist).hasSignal,
+    [watchlist]
+  );
+
   const calendarWatchlist = useMemo(
     () => watchlist.filter((item) => item.status === "watching"),
     [watchlist]
@@ -1319,7 +1488,9 @@ const App: React.FC = () => {
             <div className="space-y-2">
               <div className="flex items-center space-x-3 text-[#00f5ff] font-black text-xs uppercase tracking-[0.3em]">
                 <Clock size={14} />
-                <span>Next Airing</span>
+                <span>
+                  {hasReleaseTasteSignal ? "Taste Matched" : "Top Airing"}
+                </span>
               </div>
               <h2 className="text-5xl font-black font-outfit tracking-tighter text-white">
                 New Releases
@@ -1339,7 +1510,7 @@ const App: React.FC = () => {
             </div>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-8">
-              {upcomingGlobal.map((item, idx) => (
+              {personalizedReleases.map((item, idx) => (
                 <ShowCard
                   key={`${item.show?.id || idx}-${idx}`}
                   show={item.show}

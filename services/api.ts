@@ -25,6 +25,7 @@ const EXCLUDED_TYPES = [
   'News', 
   'Talk Show', 
   'Sports', 
+  'Reality',
   'Variety', 
   'Panel Show', 
   'Award Show', 
@@ -32,7 +33,7 @@ const EXCLUDED_TYPES = [
 ];
 
 export const getUpcomingSchedule = async (): Promise<any[]> => {
-  const days = 3;
+  const days = 7;
   const schedule: any[] = [];
   const today = new Date();
 
@@ -69,7 +70,7 @@ export const getUpcomingSchedule = async (): Promise<any[]> => {
       }
       return (b.show?.rating?.average || 0) - (a.show?.rating?.average || 0);
     })
-    .slice(0, 15);
+    .slice(0, 75);
 };
 
 export const getSchedule = async (): Promise<SearchResult[]> => {
